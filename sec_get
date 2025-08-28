@@ -1,0 +1,1407 @@
+"""
+================================================================================
+SEC RESEARCH API - FLEXIBLE FILING EXTRACTOR
+================================================================================
+A comprehensive tool for downloading and extracting content from SEC filings
+with flexible date range and filing type selection.
+
+Author: [Your Name/Handle] - Original Creator
+License: MIT License (Open Source)
+Repository: https://github.com/[your-username]/sec-research-api
+Version: 1.0.0
+Last Updated: 2025
+
+FEATURES:
+---------
+• Flexible date range filtering (presets or custom dates)
+• Comprehensive filing type selection menu (11+ categories)
+• Token-based file chunking (150KB max file size)
+• Complete plain text extraction from all filing formats
+• Parallel processing support for faster downloads
+• Intelligent content overlap between file chunks
+• Rate limiting compliance with SEC guidelines
+• Structured data extraction for key metrics
+• Table extraction and parsing capabilities
+
+REQUIREMENTS:
+------------
+• Python 3.7+
+• tiktoken library for accurate token counting
+• requests library for HTTP requests
+• Standard library modules (os, re, json, time, threading, html)
+
+INSTALLATION:
+------------
+pip install tiktoken requests
+
+USAGE:
+------
+python sec_research_api.py
+
+Follow the interactive prompts to:
+1. Enter a stock ticker symbol
+2. Select a date range (preset or custom)
+3. Choose filing types (categories or specific forms)
+4. Enable/disable parallel processing
+
+OUTPUT:
+-------
+Creates chunked text files with complete filing content:
+• Format: {TICKER}_SEC_{DATE_RANGE}_{FORMS}_{TIMESTAMP}.txt
+• Multiple parts if content exceeds token/size limits
+• Plain text extraction for maximum compatibility
+
+SEC COMPLIANCE:
+--------------
+This tool complies with SEC rate limiting guidelines:
+• Minimum 0.11 seconds between requests
+• User agent header with contact information
+• Respectful crawling practices
+
+================================================================================
+"""
+
+import os
+import re
+import json
+import time
+import sys
+import requests
+import threading
+import html
+from datetime import datetime, timedelta
+from html.parser import HTMLParser
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ================================================================================
+# CONFIGURATION AND CONSTANTS
+# ================================================================================
+
+# Import tiktoken for accurate token counting
+try:
+    import tiktoken
+except ImportError:
+    print("ERROR: tiktoken not installed. Please run: pip install tiktoken")
+    print("This library is required for accurate token counting and file chunking.")
+    sys.exit(1)
+
+# Initialize tiktoken encoder for token counting
+TOKENIZER = tiktoken.get_encoding("cl100k_base")
+
+# File size limits to ensure compatibility
+MAX_FILE_SIZE_BYTES = int(150 * 1024)  # 150KB maximum file size
+SAFETY_MARGIN_BYTES = 20 * 1024        # Safety margin for headers/footers
+TARGET_FILE_SIZE = MAX_FILE_SIZE_BYTES - SAFETY_MARGIN_BYTES
+
+# ================================================================================
+# FILING TYPE CATEGORIES
+# ================================================================================
+
+FILING_CATEGORIES = {
+    'quarterly': {
+        'name': 'Quarterly Reports',
+        'forms': ['10-Q', '10-Q/A'],
+        'description': 'Quarterly financial reports'
+    },
+    'annual': {
+        'name': 'Annual Reports',
+        'forms': ['10-K', '10-K/A'],
+        'description': 'Annual comprehensive reports'
+    },
+    'current': {
+        'name': 'Current Reports',
+        'forms': ['8-K', '8-K/A'],
+        'description': 'Material events and changes'
+    },
+    'prospectus': {
+        'name': 'Prospectus Documents',
+        'forms': ['424B1', '424B2', '424B3', '424B4', '424B5', '424B7', 'FWP', 'POSASR'],
+        'description': 'Prospectus supplements and free writing prospectuses'
+    },
+    'proxy': {
+        'name': 'Proxy Statements',
+        'forms': ['DEF 14A', 'PRE 14A', 'DEFM14A', 'DEFC14A', 'DEF 14C'],
+        'description': 'Shareholder meeting materials'
+    },
+    'insider': {
+        'name': 'Insider Trading',
+        'forms': ['3', '4', '5', '3/A', '4/A', '5/A', '144'],
+        'description': 'Insider transactions and holdings'
+    },
+    'institutional': {
+        'name': 'Institutional Holdings',
+        'forms': ['13F', '13F-HR', '13F-NT', 'N-PORT', '13-H'],
+        'description': 'Institutional investor holdings'
+    },
+    'ownership': {
+        'name': 'Beneficial Ownership',
+        'forms': ['SC 13D', 'SC13D', 'SC 13G', 'SC13G', 'SC 13D/A', 'SC 13G/A'],
+        'description': '5%+ ownership stakes'
+    },
+    'registration': {
+        'name': 'Registration Statements',
+        'forms': ['S-1', 'S-3', 'S-4', 'S-8', 'S-11', 'F-1', 'F-3', 'F-4', 'D', 'D/A'],
+        'description': 'Securities registration and offerings'
+    },
+    'foreign': {
+        'name': 'Foreign Issuer Reports',
+        'forms': ['20-F', '40-F', '6-K', '20-F/A', '40-F/A'],
+        'description': 'Foreign company filings'
+    },
+    'amendments': {
+        'name': 'Amendments & Exhibits',
+        'forms': ['EX-', 'NT 10-K', 'NT 10-Q', 'NT 20-F', 'NT 11-K'],
+        'description': 'Filing amendments and exhibits'
+    }
+}
+
+# Time period presets for easy selection
+TIME_PERIODS = {
+    '1': ('Last Quarter', 90),
+    '2': ('Last 6 Months', 180),
+    '3': ('Last Year', 365),
+    '4': ('Last 2 Years', 730),
+    '5': ('Last 5 Years', 1825),
+    '6': ('Custom Date Range', None)
+}
+
+# ================================================================================
+# UTILITY FUNCTIONS
+# ================================================================================
+
+def count_tokens(text):
+    """
+    Count the exact number of tokens in text using tiktoken.
+    
+    Args:
+        text (str): Text to count tokens for
+        
+    Returns:
+        int: Number of tokens in the text
+    """
+    if not text:
+        return 0
+    try:
+        tokens = TOKENIZER.encode(text)
+        return len(tokens)
+    except Exception as e:
+        print(f"Warning: tiktoken encoding failed, using estimation: {e}")
+        # Fallback to rough estimation (1 token ≈ 4 characters)
+        return len(text) // 4
+
+def get_text_size_bytes(text):
+    """
+    Get the size of text in bytes when encoded as UTF-8.
+    
+    Args:
+        text (str): Text to measure
+        
+    Returns:
+        int: Size in bytes
+    """
+    if not text:
+        return 0
+    return len(text.encode('utf-8'))
+
+def to_float(s: str):
+    """
+    Convert financial strings to float values.
+    Handles formats like '$1,234.56' or '(1,234.56)' for negative values.
+    
+    Args:
+        s (str): String to convert
+        
+    Returns:
+        float or None: Converted value or None if conversion fails
+    """
+    s = (s or "").strip().replace('(', '-').replace(')', '')
+    s = re.sub(r'[^0-9.\-]', '', s)
+    try:
+        return float(s)
+    except:
+        return None
+
+# ================================================================================
+# HTML PARSER CLASS
+# ================================================================================
+
+class ComprehensiveHTMLParser(HTMLParser):
+    """
+    Custom HTML parser for extracting text and tables from SEC filings.
+    
+    This parser handles the complex HTML structure of SEC filings,
+    extracting both narrative text and tabular data.
+    """
+    
+    def __init__(self):
+        """Initialize the parser with empty data structures."""
+        super().__init__()
+        self.text_content = []
+        self.tables = []
+        self.all_data = []
+        self.in_table = False
+        self.current_table = []
+        self.current_row = []
+        self.in_row = False
+        self.in_cell = False
+
+    def handle_starttag(self, tag, attrs):
+        """Process HTML opening tags."""
+        if tag == 'table':
+            self.in_table = True
+            self.current_table = []
+        elif tag == 'tr' and self.in_table:
+            self.in_row = True
+            self.current_row = []
+        elif tag in ('td', 'th') and self.in_row:
+            self.in_cell = True
+
+    def handle_endtag(self, tag):
+        """Process HTML closing tags."""
+        if tag == 'table':
+            self.in_table = False
+            if self.current_table:
+                self.tables.append(self.current_table)
+        elif tag == 'tr' and self.in_table:
+            self.in_row = False
+            if self.current_row:
+                self.current_table.append(self.current_row)
+        elif tag in ('td', 'th'):
+            self.in_cell = False
+
+    def handle_data(self, data):
+        """Process text data within HTML tags."""
+        cleaned = (data or '').strip()
+        if not cleaned:
+            return
+        self.all_data.append(cleaned)
+        if self.in_cell:
+            self.current_row.append(cleaned)
+        elif not self.in_table:
+            self.text_content.append(cleaned)
+
+    def get_all_content(self):
+        """
+        Retrieve all parsed content.
+        
+        Returns:
+            dict: Dictionary containing text, tables, and all data
+        """
+        return {
+            'text': ' '.join(self.text_content),
+            'tables': self.tables,
+            'all_data': ' '.join(self.all_data),
+        }
+
+# ================================================================================
+# FILE WRITER CLASS
+# ================================================================================
+
+class TokenBasedChunkedFileWriter:
+    """
+    Handles writing content to multiple files with token and size limits.
+    
+    This class manages the complex task of splitting large content across
+    multiple files while maintaining readability and context overlap.
+    """
+    
+    def __init__(self, base_filename, max_tokens=65300, overlap_tokens=2500):
+        """
+        Initialize the file writer.
+        
+        Args:
+            base_filename (str): Base name for output files
+            max_tokens (int): Maximum tokens per file
+            overlap_tokens (int): Tokens to overlap between chunks
+        """
+        self.base_filename = base_filename
+        self.max_tokens = max_tokens
+        self.overlap_tokens = overlap_tokens
+        self.chunk_number = 1
+        self.current_file = None
+        self.current_file_path = None
+        self.current_tokens = 0
+        self.current_bytes = 0
+        self.files_created = []
+        self.buffer = []
+        self.buffer_tokens = 0
+        self.buffer_bytes = 0
+        self.last_content_for_overlap = ""
+        self.last_overlap_tokens = 0
+        self.target_file_size = TARGET_FILE_SIZE
+        
+    def _get_chunk_filename(self):
+        """Generate filename for current chunk."""
+        name, ext = os.path.splitext(self.base_filename)
+        return f"{name}_part{self.chunk_number:04d}{ext}"
+    
+    def _extract_overlap_content(self, content, target_tokens):
+        """
+        Extract overlap content from the end of the given content.
+        
+        Args:
+            content (str): Content to extract overlap from
+            target_tokens (int): Target number of tokens for overlap
+            
+        Returns:
+            tuple: (overlap_text, token_count)
+        """
+        if not content:
+            return "", 0
+        
+        try:
+            tokens = TOKENIZER.encode(content)
+            total_tokens = len(tokens)
+            
+            if total_tokens <= target_tokens:
+                return content, total_tokens
+            
+            # Extract the target number of tokens from the end
+            overlap_token_ids = tokens[-target_tokens:]
+            overlap_text = TOKENIZER.decode(overlap_token_ids)
+            
+            # Check if overlap is too large in bytes
+            overlap_bytes = get_text_size_bytes(overlap_text)
+            if overlap_bytes > self.target_file_size // 3:
+                # Reduce overlap if it's too large
+                reduced_tokens = min(target_tokens // 3, 500)
+                overlap_token_ids = tokens[-reduced_tokens:]
+                overlap_text = TOKENIZER.decode(overlap_token_ids)
+                return overlap_text, reduced_tokens
+            
+            # Try to find a natural break point (paragraph or sentence)
+            last_para = overlap_text.rfind('\n\n')
+            if last_para > len(overlap_text) * 0.3:
+                overlap_text = overlap_text[last_para+2:]
+            else:
+                # Look for sentence boundaries
+                for delimiter in ['. ', '.\n', '! ', '!\n', '? ', '?\n']:
+                    last_sentence = overlap_text.rfind(delimiter)
+                    if last_sentence > len(overlap_text) * 0.3:
+                        overlap_text = overlap_text[last_sentence+len(delimiter):]
+                        break
+            
+            return overlap_text, count_tokens(overlap_text)
+            
+        except Exception as e:
+            print(f"Warning: Failed to extract overlap: {e}")
+            # Fallback to character-based estimation
+            estimated_chars = target_tokens * 4
+            if len(content) <= estimated_chars:
+                return content, count_tokens(content)
+            return content[-estimated_chars:], count_tokens(content[-estimated_chars:])
+    
+    def _open_new_file(self):
+        """Open a new chunk file and handle overlap from previous chunk."""
+        if self.current_file:
+            # Extract overlap content from the current file before closing
+            if self.current_file_path and os.path.exists(self.current_file_path):
+                try:
+                    with open(self.current_file_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read()
+                        if len(file_content) > 10000:
+                            last_portion = file_content[-10000:]
+                            self.last_content_for_overlap, self.last_overlap_tokens = \
+                                self._extract_overlap_content(last_portion, min(self.overlap_tokens, 1000))
+                except Exception as e:
+                    print(f"Warning: Could not extract overlap: {e}")
+                    self.last_content_for_overlap = ""
+                    self.last_overlap_tokens = 0
+            
+            self.current_file.close()
+            actual_size = os.path.getsize(self.current_file_path)
+            print(f"   Closed {os.path.basename(self.current_file_path)}: {actual_size:,} bytes ({actual_size/1024:.1f}KB)")
+        
+        # Create new file
+        filename = self._get_chunk_filename()
+        self.current_file_path = filename
+        self.current_file = open(filename, 'w', encoding='utf-8')
+        self.files_created.append(filename)
+        self.current_tokens = 0
+        self.current_bytes = 0
+        
+        # Write header
+        header = f"{'='*100}\n"
+        header += f"TOKEN-CHUNKED FILE - PART {self.chunk_number:04d}\n"
+        header += f"Max tokens: {self.max_tokens:,} | Max size: {MAX_FILE_SIZE_BYTES/1024:.1f}KB\n"
+        header += f"{'='*100}\n\n"
+        self.current_file.write(header)
+        self.current_tokens = count_tokens(header)
+        self.current_bytes = get_text_size_bytes(header)
+        
+        # Add overlap from previous chunk if this isn't the first file
+        if self.chunk_number > 1 and self.last_content_for_overlap:
+            overlap_content = f"\n[OVERLAP FROM PART {self.chunk_number-1:04d}]\n"
+            overlap_content += self.last_content_for_overlap
+            overlap_content += f"\n[END OVERLAP]\n\n"
+            self.current_file.write(overlap_content)
+            self.current_tokens += count_tokens(overlap_content)
+            self.current_bytes += get_text_size_bytes(overlap_content)
+        
+        self.chunk_number += 1
+        return filename
+    
+    def _should_create_new_file(self, content):
+        """
+        Check if adding content would exceed limits.
+        
+        Args:
+            content (str): Content to check
+            
+        Returns:
+            bool: True if new file should be created
+        """
+        content_tokens = count_tokens(content)
+        content_bytes = get_text_size_bytes(content)
+        
+        # Flush buffer if needed
+        if self.buffer and self.current_file:
+            content_to_write = ''.join(self.buffer)
+            self.current_file.write(content_to_write)
+            self.current_file.flush()
+            self.current_tokens += self.buffer_tokens
+            self.current_bytes += self.buffer_bytes
+            self.buffer = []
+            self.buffer_tokens = 0
+            self.buffer_bytes = 0
+        
+        # Check actual file size
+        actual_file_size = 0
+        if self.current_file_path and os.path.exists(self.current_file_path):
+            actual_file_size = os.path.getsize(self.current_file_path)
+        
+        total_tokens = self.current_tokens + content_tokens
+        total_bytes = actual_file_size + content_bytes
+        footer_reserve = 500  # Reserve space for footer
+        
+        # Check limits
+        if total_tokens > self.max_tokens:
+            print(f"   → Token limit reached: {total_tokens:,} > {self.max_tokens:,}")
+            return True
+        
+        if total_bytes + footer_reserve > (self.target_file_size - 5000):
+            print(f"   → Size limit reached: {(total_bytes + footer_reserve):,} bytes")
+            return True
+        
+        return False
+    
+    def write(self, content):
+        """
+        Write content to file, creating new files as needed.
+        
+        Args:
+            content (str): Content to write
+        """
+        if not content:
+            return
+        
+        if self.current_file is None:
+            self._open_new_file()
+        
+        content_bytes = get_text_size_bytes(content)
+        
+        # Handle very large content by splitting at sentence boundaries
+        if content_bytes > 50000:
+            sentences = content.split('. ')
+            current_chunk = []
+            current_chunk_size = 0
+            
+            for sentence in sentences:
+                sentence_with_period = sentence + '. ' if sentence != sentences[-1] else sentence
+                sentence_size = get_text_size_bytes(sentence_with_period)
+                
+                if current_chunk and (current_chunk_size + sentence_size > 30000):
+                    chunk_content = ''.join(current_chunk)
+                    if self._should_create_new_file(chunk_content):
+                        self._open_new_file()
+                    self._write_content_directly(chunk_content)
+                    current_chunk = []
+                    current_chunk_size = 0
+                
+                current_chunk.append(sentence_with_period)
+                current_chunk_size += sentence_size
+            
+            if current_chunk:
+                chunk_content = ''.join(current_chunk)
+                if self._should_create_new_file(chunk_content):
+                    self._open_new_file()
+                self._write_content_directly(chunk_content)
+        else:
+            if self._should_create_new_file(content):
+                self._open_new_file()
+            self._write_content_directly(content)
+    
+    def _write_content_directly(self, content):
+        """
+        Write content directly to the current file.
+        
+        Args:
+            content (str): Content to write
+        """
+        if not content or not self.current_file:
+            return
+            
+        content_tokens = count_tokens(content)
+        content_bytes = get_text_size_bytes(content)
+        
+        self.current_file.write(content)
+        self.current_file.flush()
+        self.current_tokens += content_tokens
+        self.current_bytes += content_bytes
+    
+    def close(self):
+        """
+        Close the current file and return list of created files.
+        
+        Returns:
+            list: List of file paths created
+        """
+        # Flush any remaining buffer content
+        if self.buffer and self.current_file:
+            buffer_content = ''.join(self.buffer)
+            if self._should_create_new_file(buffer_content):
+                self._open_new_file()
+                self._write_content_directly(buffer_content)
+            else:
+                self._write_content_directly(buffer_content)
+            self.buffer = []
+            self.buffer_tokens = 0
+            self.buffer_bytes = 0
+        
+        # Close current file with footer
+        if self.current_file:
+            footer = f"\n\n{'='*100}\n"
+            footer += f"END OF PART {self.chunk_number-1:04d}\n"
+            footer += f"Tokens: {self.current_tokens:,} | Size: {self.current_bytes:,} bytes\n"
+            footer += f"{'='*100}\n"
+            self.current_file.write(footer)
+            self.current_file.close()
+            
+            actual_size = os.path.getsize(self.current_file_path)
+            print(f"   Closed {os.path.basename(self.current_file_path)}: {actual_size:,} bytes ({actual_size/1024:.1f}KB)")
+            
+            self.current_file = None
+            self.current_file_path = None
+        
+        return self.files_created
+
+# ================================================================================
+# MAIN SEC EXTRACTOR CLASS
+# ================================================================================
+
+class FlexibleSECExtractor:
+    """
+    Main class for extracting SEC filing content.
+    
+    This class handles all interactions with the SEC EDGAR database,
+    including company lookup, filing retrieval, and content extraction.
+    """
+    
+    def __init__(self, ticker: str, max_workers: int = 5):
+        """
+        Initialize the SEC extractor.
+        
+        Args:
+            ticker (str): Stock ticker symbol
+            max_workers (int): Maximum parallel download workers
+        """
+        self.ticker = ticker.upper().strip()
+        # Update the User-Agent with your actual contact information
+        self.headers = {'User-Agent': 'YourName/1.0 (your.email@example.com)'}
+        self.company_name = ""
+        self.cik = ""
+        self.max_workers = max_workers
+        
+        self.all_filings = []
+        self.filing_contents = {}
+        self.extracted_data = defaultdict(dict)
+        self.financial_data = defaultdict(dict)
+        
+        # Rate limiting
+        self._rate_lock = threading.Lock()
+        self._last_request = 0.0
+        
+        # Filtering parameters
+        self.start_date = None
+        self.end_date = None
+        self.selected_forms = []
+    
+    def rate_limit(self, min_interval: float = 0.11):
+        """
+        Enforce SEC rate limiting (10 requests per second max).
+        
+        Args:
+            min_interval (float): Minimum seconds between requests
+        """
+        with self._rate_lock:
+            dt = time.time() - self._last_request
+            if dt < min_interval:
+                time.sleep(min_interval - dt)
+            self._last_request = time.time()
+    
+    def get_cik_from_ticker(self) -> bool:
+        """
+        Resolve CIK (Central Index Key) from ticker symbol.
+        
+        Returns:
+            bool: True if CIK found, False otherwise
+        """
+        try:
+            # Check for cached ticker mapping
+            path = "ticker.json"
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    companies = json.load(f)
+            else:
+                # Download ticker mapping from SEC
+                self.rate_limit()
+                r = requests.get("https://www.sec.gov/files/company_tickers.json", 
+                               headers=self.headers, timeout=30)
+                r.raise_for_status()
+                companies = r.json()
+                # Cache for future use
+                with open(path, "w") as f:
+                    json.dump(companies, f)
+            
+            # Search for ticker
+            records = companies.values() if isinstance(companies, dict) else companies
+            for rec in records:
+                t = str(rec.get("ticker", "")).upper()
+                if t == self.ticker:
+                    self.cik = str(rec.get("cik_str", "")).zfill(10)
+                    self.company_name = rec.get("title", "")
+                    return True
+            
+            print(f"❌ Ticker '{self.ticker}' not found in SEC index")
+            return False
+        except Exception as e:
+            print(f"Error getting CIK: {e}")
+            return False
+    
+    def get_all_filings(self):
+        """
+        Load filing index with date and form type filtering.
+        
+        Returns:
+            list: List of filtered filings or None on error
+        """
+        try:
+            self.rate_limit()
+            url = f"https://data.sec.gov/submissions/CIK{self.cik}.json"
+            r = requests.get(url, headers=self.headers, timeout=30)
+            if r.status_code != 200:
+                print(f"SEC registry error {r.status_code}")
+                return None
+            data = r.json()
+            
+            # Process recent filings
+            recent = data.get('filings', {}).get('recent', {})
+            forms = recent.get('form', []) or []
+            self.all_filings = []
+            
+            for i in range(len(forms)):
+                filing_date = recent.get('filingDate', [''])[i]
+                form_type = forms[i]
+                
+                # Apply date filter
+                if self.start_date and filing_date:
+                    try:
+                        f_date = datetime.strptime(filing_date, '%Y-%m-%d')
+                        if f_date < self.start_date or f_date > self.end_date:
+                            continue
+                    except:
+                        pass
+                
+                # Apply form type filter
+                if self.selected_forms:
+                    form_match = False
+                    for selected_form in self.selected_forms:
+                        if selected_form in form_type or form_type == selected_form:
+                            form_match = True
+                            break
+                    if not form_match:
+                        continue
+                
+                self.all_filings.append({
+                    'form': form_type,
+                    'filingDate': filing_date,
+                    'accessionNumber': recent.get('accessionNumber', [''])[i],
+                    'primaryDocument': recent.get('primaryDocument', [None]*len(forms))[i],
+                    'reportDate': recent.get('reportDate', [''])[i] if recent.get('reportDate') else '',
+                    'size': recent.get('size', [0]*len(forms))[i] if recent.get('size') else 0,
+                })
+            
+            # Load older filings if needed (for date ranges > 2 years)
+            if self.start_date and self.start_date < datetime.now() - timedelta(days=365*2):
+                for file_info in (data.get('filings', {}).get('files', []) or [])[:3]:
+                    try:
+                        self.rate_limit()
+                        older_url = f"https://data.sec.gov/submissions/{file_info['name']}"
+                        rr = requests.get(older_url, headers=self.headers, timeout=30)
+                        if rr.status_code == 200:
+                            older = rr.json()
+                            forms = older.get('form', []) or []
+                            for i in range(min(len(forms), 200)):
+                                filing_date = older.get('filingDate', [''])[i]
+                                form_type = forms[i]
+                                
+                                # Apply filters
+                                if self.start_date and filing_date:
+                                    try:
+                                        f_date = datetime.strptime(filing_date, '%Y-%m-%d')
+                                        if f_date < self.start_date or f_date > self.end_date:
+                                            continue
+                                    except:
+                                        pass
+                                
+                                if self.selected_forms:
+                                    form_match = False
+                                    for selected_form in self.selected_forms:
+                                        if selected_form in form_type or form_type == selected_form:
+                                            form_match = True
+                                            break
+                                    if not form_match:
+                                        continue
+                                
+                                self.all_filings.append({
+                                    'form': form_type,
+                                    'filingDate': filing_date,
+                                    'accessionNumber': older.get('accessionNumber', [''])[i],
+                                    'primaryDocument': older.get('primaryDocument', [None]*len(forms))[i] if older.get('primaryDocument') else None,
+                                    'reportDate': older.get('reportDate', [''])[i] if older.get('reportDate') else '',
+                                })
+                    except Exception:
+                        pass
+            
+            # Sort by date (newest first)
+            self.all_filings.sort(key=lambda x: x.get('filingDate', ''), reverse=True)
+            return self.all_filings
+        except Exception as e:
+            print(f"Error getting filings: {e}")
+            return None
+    
+    def extract_plain_text(self, content: str):
+        """
+        Extract plain text from any SEC filing format (HTML, EDGAR, or plain text).
+        
+        This method handles the various formats used in SEC filings and
+        converts them all to clean, readable plain text.
+        
+        Args:
+            content (str): Raw filing content
+            
+        Returns:
+            str: Clean plain text
+        """
+        if not content:
+            return ""
+            
+        # Remove EDGAR document wrappers
+        content = re.sub(r'<DOCUMENT>.*?<TEXT>', '', content, flags=re.DOTALL | re.IGNORECASE)
+        content = re.sub(r'</TEXT>.*?</DOCUMENT>', '', content, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Remove EDGAR header tags
+        content = re.sub(r'<TYPE>.*?(?=<)', '', content, flags=re.DOTALL | re.IGNORECASE)
+        content = re.sub(r'<SEQUENCE>.*?(?=<)', '', content, flags=re.DOTALL | re.IGNORECASE)
+        content = re.sub(r'<FILENAME>.*?(?=<)', '', content, flags=re.DOTALL | re.IGNORECASE)
+        content = re.sub(r'<DESCRIPTION>.*?(?=<)', '', content, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Check if it's HTML
+        if '<html' in content.lower() or '<HTML' in content:
+            # Remove script and style elements
+            content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
+            
+            # Strip all HTML tags
+            content = re.sub(r'<[^>]+>', ' ', content)
+            
+            # Decode HTML entities
+            content = html.unescape(content)
+        
+        # Clean up XBRL tags if present
+        content = re.sub(r'</?[A-Za-z]+:[^>]*>', ' ', content)
+        content = re.sub(r'</?ix:[^>]*>', ' ', content)
+        
+        # Remove checkboxes and special characters
+        content = re.sub(r'[☐☑☒□■]', ' ', content)
+        
+        # Clean up whitespace
+        content = re.sub(r'\s+', ' ', content)
+        content = re.sub(r'\n\s*\n\s*\n+', '\n\n', content)
+        content = re.sub(r' +', ' ', content)
+        
+        # Remove special characters that often appear in EDGAR docs
+        content = re.sub(r'[^\x00-\x7F]+', ' ', content)  # Remove non-ASCII
+        content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', ' ', content)  # Remove control chars
+        
+        # Fix common formatting issues
+        content = re.sub(r'(\w)([A-Z])', r'\1 \2', content)  # Add space between camelCase
+        content = re.sub(r'\.([A-Z])', r'. \1', content)  # Add space after period
+        
+        return content.strip()
+    
+    def download_filing_content(self, filing: dict):
+        """
+        Download and parse filing content.
+        
+        Args:
+            filing (dict): Filing metadata
+            
+        Returns:
+            dict: Parsed filing content or None on error
+        """
+        try:
+            accession = filing['accessionNumber']
+            acc_no_raw = accession.replace('-', '')
+            pd = filing.get('primaryDocument')
+            self.rate_limit()
+            
+            # Construct URL based on available information
+            if pd:
+                url = f"https://www.sec.gov/Archives/edgar/data/{self.cik}/{acc_no_raw}/{pd}"
+            else:
+                url = f"https://www.sec.gov/Archives/edgar/data/{self.cik}/{acc_no_raw}/{accession}.txt"
+            
+            r = requests.get(url, headers=self.headers, timeout=60)
+            if r.status_code != 200:
+                return None
+            
+            content = r.text or ""
+            
+            # Extract plain text
+            plain_text = self.extract_plain_text(content)
+            
+            out = {
+                'form': filing['form'],
+                'date': filing.get('filingDate', ''),
+                'accession': accession,
+                'plain_text': plain_text,
+                'tables': [],
+                'key_sections': {},
+                'structured_data': {},
+            }
+            
+            # Extract tables if HTML
+            if '<html' in content.lower():
+                parser = ComprehensiveHTMLParser()
+                parser.feed(content)
+                parsed = parser.get_all_content()
+                out['tables'] = parsed['tables']
+            
+            # Extract structured data and sections
+            out['structured_data'] = self.extract_structured_data(filing['form'], plain_text)
+            out['key_sections'] = self.extract_sections(plain_text)
+            
+            return out
+        except Exception as e:
+            print(f"Error downloading filing: {e}")
+            return None
+    
+    def extract_xbrl(self, content: str):
+        """
+        Extract XBRL (eXtensible Business Reporting Language) data.
+        
+        Args:
+            content (str): Filing content
+            
+        Returns:
+            dict: Extracted XBRL data
+        """
+        x = {}
+        # Extract ix:nonFraction tags
+        for m in re.finditer(r'<ix:nonFraction[^>]*name="([^"]+)"[^>]*>([^<]+)</ix:nonFraction>', content, re.I):
+            k = m.group(1).split(':')[-1]
+            v = (m.group(2) or '').strip()
+            n = to_float(v)
+            x[k] = n if n is not None else v
+        # Extract other XBRL tags
+        for m in re.finditer(r'<([A-Za-z_]\w*:)?([A-Za-z][\w\-]*)[^>]*>([^<]+)</\1?\2>', content, re.I):
+            k, v = m.group(2), (m.group(3) or '').strip()
+            if k not in x:
+                n = to_float(v)
+                x[k] = n if n is not None else v
+        return x
+    
+    def extract_structured_data(self, form_type: str, content: str):
+        """
+        Extract structured data based on form type.
+        
+        Different form types contain different key information.
+        This method extracts the most relevant data for each type.
+        
+        Args:
+            form_type (str): SEC form type
+            content (str): Filing content
+            
+        Returns:
+            dict: Extracted structured data
+        """
+        d = {'form_type': form_type}
+        
+        # Financial reports (10-Q, 10-K)
+        if '10-Q' in form_type or '10-K' in form_type:
+            m = re.search(r'(?:total\s+)?revenues?\s*[:$]\s*([0-9,.\(\)$]+)', content, re.I)
+            if m: d['revenue'] = m.group(1)
+            m = re.search(r'net\s+income\s*[:$]\s*([0-9,.\(\)$]+)', content, re.I)
+            if m: d['net_income'] = m.group(1)
+            m = re.search(r'earnings?\s+per\s+share\s*[:$]\s*([0-9.]+)', content, re.I)
+            if m: d['eps'] = m.group(1)
+        
+        # Current reports (8-K)
+        elif '8-K' in form_type:
+            items = re.findall(r'Item\s+([0-9.]+)', content)
+            if items: d['items_reported'] = sorted(set(items))
+        
+        # Insider trading forms
+        elif form_type in ('3', '4', '5'):
+            m = re.search(r'reporting\s+owner.*?:\s*([A-Za-z\s]+)', content, re.I)
+            if m: d['reporting_owner'] = m.group(1).strip()
+            m = re.search(r'transaction\s+shares.*?:\s*([0-9,]+)', content, re.I)
+            if m: d['transaction_shares'] = m.group(1)
+        
+        # Institutional holdings
+        elif '13F' in form_type:
+            d['institutional_holdings'] = 'Yes'
+            m = re.search(r'(?:total\s+)?value.*?\$([0-9,.\(\)$]+)', content, re.I)
+            if m: d['total_holdings_value'] = m.group(1)
+        
+        # Beneficial ownership
+        elif 'SC 13' in form_type:
+            d['beneficial_ownership'] = 'Yes'
+            m = re.search(r'([0-9.]+)\s*%', content, re.I)
+            if m: d['ownership_percentage'] = m.group(1)
+        
+        return d
+    
+    def extract_sections(self, content: str):
+        """
+        Extract key sections from filing.
+        
+        Args:
+            content (str): Filing content
+            
+        Returns:
+            dict: Dictionary of extracted sections
+        """
+        sections = {}
+        patterns = [
+            (r'item\s*1[.\s]*business', 'Business Overview'),
+            (r'item\s*1a[.\s]*risk\s*factors', 'Risk Factors'),
+            (r'item\s*2[.\s]*(?:management.*?discussion|md&a)', 'MD&A'),
+            (r'item\s*7[.\s]*financial\s*statements', 'Financial Statements'),
+            (r'(?:consolidated\s+)?balance\s+sheet', 'Balance Sheet'),
+            (r'(?:consolidated\s+)?income\s+statement', 'Income Statement'),
+        ]
+        
+        for pat, name in patterns:
+            m = re.search(pat, content, re.I)
+            if m:
+                start = m.start()
+                end = min(start + 50000, len(content))  # Limit section size
+                chunk = content[start:end].strip()
+                sections[name] = chunk
+        
+        return sections
+    
+    def process_filing_batch(self, batch, use_parallel=False):
+        """
+        Process a batch of filings.
+        
+        Args:
+            batch (list): List of filings to process
+            use_parallel (bool): Use parallel processing
+            
+        Returns:
+            dict: Dictionary of processed filing contents
+        """
+        results = {}
+        if use_parallel:
+            ex = None
+            try:
+                ex = ThreadPoolExecutor(max_workers=self.max_workers)
+                fut = {ex.submit(self.download_filing_content, f): f for f in batch}
+                for f in as_completed(fut):
+                    filing = fut[f]
+                    try:
+                        res = f.result(timeout=60)
+                        if res:
+                            key = f"{filing['form']}_{filing['filingDate']}_{filing['accessionNumber']}"
+                            results[key] = res
+                    except Exception as e:
+                        print(f"Error processing {filing['form']}: {e}")
+            finally:
+                if ex: 
+                    ex.shutdown(wait=True, cancel_futures=True)
+        else:
+            for filing in batch:
+                try:
+                    res = self.download_filing_content(filing)
+                    if res:
+                        key = f"{filing['form']}_{filing['filingDate']}_{filing['accessionNumber']}"
+                        results[key] = res
+                except Exception as e:
+                    print(f"Error processing {filing['form']}: {e}")
+        return results
+    
+    def create_report(self, max_tokens=65300, overlap_tokens=2500):
+        """
+        Create the output report with all extracted content.
+        
+        Args:
+            max_tokens (int): Maximum tokens per file
+            overlap_tokens (int): Overlap tokens between chunks
+            
+        Returns:
+            list: List of created file paths
+        """
+        # Create descriptive filename
+        date_str = ""
+        if self.start_date:
+            date_str = f"_{self.start_date.strftime('%Y%m%d')}_to_{self.end_date.strftime('%Y%m%d')}"
+        
+        form_str = ""
+        if self.selected_forms and len(self.selected_forms) <= 3:
+            form_str = "_" + "_".join([f.replace(' ', '').replace('/', '') for f in self.selected_forms[:3]])
+        elif self.selected_forms:
+            form_str = f"_{len(self.selected_forms)}forms"
+        
+        base_filename = f"{self.ticker}_SEC{date_str}{form_str}_{datetime.now().strftime('%Y%m%d')}.txt"
+        writer = TokenBasedChunkedFileWriter(base_filename, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
+        
+        # Write header
+        header = f"{'='*100}\n"
+        header += f"SEC FILING EXTRACTION REPORT (PLAIN TEXT)\n"
+        header += f"{'='*100}\n"
+        header += f"Company: {self.company_name}\n"
+        header += f"Ticker: {self.ticker}\n"
+        header += f"CIK: {self.cik}\n"
+        if self.start_date:
+            header += f"Date Range: {self.start_date.strftime('%Y-%m-%d')} to {self.end_date.strftime('%Y-%m-%d')}\n"
+        if self.selected_forms:
+            header += f"Filing Types: {', '.join(self.selected_forms)}\n"
+        header += f"Filings Processed: {len(self.filing_contents)}\n"
+        header += f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        header += f"{'='*100}\n\n"
+        
+        writer.write(header)
+        
+        # Write summary
+        if self.filing_contents:
+            summary = "FILING SUMMARY\n" + "-"*50 + "\n"
+            form_counts = defaultdict(int)
+            for key in self.filing_contents:
+                form = key.split('_')[0]
+                form_counts[form] += 1
+            
+            for form, count in sorted(form_counts.items(), key=lambda x: x[1], reverse=True):
+                summary += f"  {form}: {count} filings\n"
+            summary += "\n"
+            writer.write(summary)
+        
+        # Write filing contents
+        for key, content in sorted(self.filing_contents.items(), key=lambda x: x[1].get('date', ''), reverse=True):
+            filing_section = f"\n{'='*80}\n"
+            filing_section += f"FILING: {content['form']} | Date: {content['date']}\n"
+            filing_section += f"Accession: {content['accession']}\n"
+            filing_section += f"{'='*80}\n\n"
+            writer.write(filing_section)
+            
+            # Write structured data
+            if content.get('structured_data'):
+                struct = "EXTRACTED DATA:\n" + "-"*40 + "\n"
+                for k, v in content['structured_data'].items():
+                    struct += f"  {k}: {v}\n"
+                struct += "\n"
+                writer.write(struct)
+            
+            # Write key sections
+            if content.get('key_sections'):
+                for section_name, section_text in content['key_sections'].items():
+                    section = f"\n{section_name.upper()}:\n" + "-"*40 + "\n"
+                    section += section_text[:10000] + "\n"
+                    writer.write(section)
+            
+            # Write tables
+            if content.get('tables') and len(content['tables']) > 0:
+                tables = "\nTABLES:\n" + "-"*40 + "\n"
+                for i, table in enumerate(content['tables'][:5], 1):
+                    tables += f"Table {i}:\n"
+                    for row in table[:20]:
+                        tables += "  " + " | ".join(map(str, row)) + "\n"
+                    if len(table) > 20:
+                        tables += f"  ... ({len(table)-20} more rows)\n"
+                    tables += "\n"
+                writer.write(tables)
+            
+            # Write full content
+            if content.get('plain_text'):
+                full_header = "\nFULL CONTENT (PLAIN TEXT):\n" + "-"*40 + "\n"
+                writer.write(full_header)
+                writer.write(content['plain_text'])
+                writer.write("\n")
+        
+        # Write footer
+        footer = f"\n{'='*100}\n"
+        footer += "END OF REPORT\n"
+        footer += f"Total Filings: {len(self.filing_contents)}\n"
+        footer += f"{'='*100}\n"
+        writer.write(footer)
+        
+        files_created = writer.close()
+        return files_created
+    
+    def run(self, start_date=None, end_date=None, selected_forms=None, 
+            max_filings=None, use_parallel=False):
+        """
+        Main execution method.
+        
+        Args:
+            start_date (datetime): Start date for filtering
+            end_date (datetime): End date for filtering
+            selected_forms (list): List of form types to include
+            max_filings (int): Maximum number of filings to process
+            use_parallel (bool): Use parallel processing
+            
+        Returns:
+            dict: Results dictionary or False on error
+        """
+        self.start_date = start_date
+        self.end_date = end_date
+        self.selected_forms = selected_forms or []
+        
+        print(f"\n🚀 FLEXIBLE SEC CONTENT EXTRACTOR (PLAIN TEXT OUTPUT)")
+        print(f"   Ticker: {self.ticker}")
+        if self.start_date:
+            print(f"   Date Range: {self.start_date.strftime('%Y-%m-%d')} to {self.end_date.strftime('%Y-%m-%d')}")
+        if self.selected_forms:
+            print(f"   Filing Types: {', '.join(self.selected_forms)}")
+        print("="*70)
+        
+        # Get company CIK
+        if not self.get_cik_from_ticker():
+            return False
+        
+        print(f"✓ Company: {self.company_name}")
+        print(f"✓ CIK: {self.cik}")
+        
+        # Fetch filings
+        print("\n📂 Fetching filings...")
+        self.get_all_filings()
+        print(f"✓ Found {len(self.all_filings)} matching filings")
+        
+        if not self.all_filings:
+            print("❌ No filings found matching criteria")
+            return False
+        
+        # Process filings
+        filings = self.all_filings[:max_filings] if max_filings else self.all_filings
+        print(f"\n📥 Processing {len(filings)} filings...")
+        
+        batch_size = 10 if use_parallel else 5
+        for i in range(0, len(filings), batch_size):
+            batch = filings[i:i+batch_size]
+            print(f"   Batch {i//batch_size + 1}: {len(batch)} filings...")
+            batch_results = self.process_filing_batch(batch, use_parallel=use_parallel)
+            self.filing_contents.update(batch_results)
+        
+        # Create report
+        print(f"\n📝 Creating report...")
+        output_files = self.create_report()
+        
+        print(f"\n✅ SUCCESS! Extraction complete")
+        print(f"\n📄 Output Files:")
+        for f in output_files:
+            size_kb = os.path.getsize(f) / 1024
+            print(f"   • {f} ({size_kb:.1f}KB)")
+        
+        return {
+            'success': True,
+            'files': output_files,
+            'stats': {
+                'filings_processed': len(self.filing_contents),
+                'date_range': f"{self.start_date.strftime('%Y-%m-%d') if self.start_date else 'All'} to {self.end_date.strftime('%Y-%m-%d') if self.end_date else 'All'}",
+                'form_types': self.selected_forms or 'All'
+            }
+        }
+
+# ================================================================================
+# MAIN FUNCTION - INTERACTIVE CLI
+# ================================================================================
+
+def main():
+    """
+    Interactive command-line interface for the SEC Research API.
+    
+    This function provides a user-friendly interface for:
+    - Selecting companies by ticker symbol
+    - Choosing date ranges (preset or custom)
+    - Selecting filing types (categories or specific forms)
+    - Configuring processing options
+    """
+    print("="*70)
+    print("FLEXIBLE SEC CONTENT EXTRACTOR - PLAIN TEXT OUTPUT")
+    print("Filter by Date Range and Filing Type")
+    print("="*70)
+    
+    # Get ticker symbol
+    ticker = input("\nEnter stock ticker: ").strip().upper()
+    if not ticker:
+        print("❌ No ticker provided")
+        return
+    
+    # Select time period
+    print("\n📅 SELECT TIME PERIOD:")
+    print("-"*40)
+    for key, (label, _) in TIME_PERIODS.items():
+        print(f"  {key}. {label}")
+    
+    period_choice = input("\nSelect period (1-6): ").strip()
+    
+    start_date = None
+    end_date = datetime.now()
+    
+    if period_choice in TIME_PERIODS:
+        label, days = TIME_PERIODS[period_choice]
+        if days:  # Preset period
+            start_date = datetime.now() - timedelta(days=days)
+            print(f"✓ Selected: {label}")
+        else:  # Custom date range
+            try:
+                start_str = input("Enter start date (YYYY-MM-DD): ").strip()
+                start_date = datetime.strptime(start_str, '%Y-%m-%d')
+                end_str = input("Enter end date (YYYY-MM-DD, or press Enter for today): ").strip()
+                if end_str:
+                    end_date = datetime.strptime(end_str, '%Y-%m-%d')
+                print(f"✓ Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+            except:
+                print("Invalid date format, using last year")
+                start_date = datetime.now() - timedelta(days=365)
+    else:
+        print("Invalid choice, using last year")
+        start_date = datetime.now() - timedelta(days=365)
+    
+    # Select filing types
+    print("\n📋 SELECT FILING TYPES:")
+    print("-"*40)
+    print("  0. ALL filing types")
+    categories = list(FILING_CATEGORIES.items())
+    for i, (key, info) in enumerate(categories, 1):
+        print(f"  {i}. {info['name']} - {info['description']}")
+        print(f"     Forms: {', '.join(info['forms'][:3])}{'...' if len(info['forms']) > 3 else ''}")
+    
+    print("\n  M. MULTI-SELECT mode (choose specific categories)")
+    print("  C. CUSTOM forms (enter specific form names)")
+    
+    type_choice = input("\nEnter choice (0-{}, M, or C): ".format(len(categories))).strip().upper()
+    
+    selected_forms = []
+    selected_category_names = []
+    
+    if type_choice == '0':
+        print("✓ Selected: ALL filing types")
+        selected_forms = []  # Empty list means ALL
+    elif type_choice == 'M':
+        # Multi-select mode
+        print("\nEnter category numbers separated by commas (e.g., 1,3,5):")
+        multi_choice = input("Categories: ").strip()
+        choices = [c.strip() for c in multi_choice.split(',')]
+        
+        for choice in choices:
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(categories):
+                    key, info = categories[idx]
+                    selected_forms.extend(info['forms'])
+                    selected_category_names.append(info['name'])
+                    print(f"✓ Added: {info['name']}")
+    elif type_choice == 'C':
+        # Custom forms mode
+        print("\nEnter form names separated by commas (e.g., 10-Q,8-K,13F):")
+        custom_forms = input("Forms: ").strip()
+        forms = [f.strip().upper() for f in custom_forms.split(',')]
+        selected_forms = forms
+        print(f"✓ Added forms: {', '.join(forms)}")
+    elif type_choice.isdigit():
+        # Single category selection
+        idx = int(type_choice) - 1
+        if 0 <= idx < len(categories):
+            key, info = categories[idx]
+            selected_forms = info['forms']
+            selected_category_names.append(info['name'])
+            print(f"✓ Selected: {info['name']}")
+            print(f"   Forms included: {', '.join(info['forms'])}")
+        else:
+            print("Invalid choice, using ALL filing types")
+            selected_forms = []
+    else:
+        print("Invalid choice, using ALL filing types")
+        selected_forms = []
+    
+    # Remove duplicates while preserving order
+    if selected_forms:
+        seen = set()
+        unique_forms = []
+        for form in selected_forms:
+            if form not in seen:
+                seen.add(form)
+                unique_forms.append(form)
+        selected_forms = unique_forms
+    
+    # Parallel processing option
+    parallel = input("\nUse parallel processing for faster downloads? (y/n, default=n): ").strip().lower() == 'y'
+    
+    # Display summary
+    print("\n" + "="*70)
+    print("EXTRACTION SUMMARY:")
+    print(f"  Ticker: {ticker}")
+    print(f"  Date Range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+    
+    if selected_forms:
+        if len(selected_forms) <= 5:
+            print(f"  Filing Types: {', '.join(selected_forms)}")
+        else:
+            print(f"  Filing Types: {', '.join(selected_forms[:5])}...")
+            print(f"                (and {len(selected_forms)-5} more forms)")
+        print(f"  Total Form Types Selected: {len(selected_forms)}")
+    else:
+        print(f"  Filing Types: ALL")
+    
+    print(f"  Processing: {'PARALLEL' if parallel else 'SEQUENTIAL'}")
+    print(f"  Output Format: PLAIN TEXT")
+    print("="*70)
+    
+    # Confirm execution
+    if input("\nProceed? (y/n): ").strip().lower() != 'y':
+        print("Cancelled.")
+        return
+    
+    # Run extraction
+    extractor = FlexibleSECExtractor(ticker)
+    result = extractor.run(
+        start_date=start_date,
+        end_date=end_date,
+        selected_forms=selected_forms,
+        max_filings=None,  # Process all matching filings
+        use_parallel=parallel
+    )
+    
+    # Display results
+    if result and result.get('success'):
+        print("\n" + "="*70)
+        print("🎉 EXTRACTION COMPLETE!")
+        print("="*70)
+        print(f"Files created: {len(result['files'])}")
+        for f in result['files']:
+            print(f"  • {f}")
+        
+        # Clean exit for parallel processing
+        if parallel:
+            os._exit(0)
+
+# ================================================================================
+# ENTRY POINT
+# ================================================================================
+
+if __name__ == "__main__":
+    main()
