@@ -121,7 +121,7 @@ Created by Azani Peterkin - Original implementation
 
 ## Contributing
 
-Pull requests welcome. Please maintain SEC compliance and rate limiting.
+Pull requests welcomed. Please maintain SEC compliance and rate limiting.
 
 ## Disclaimer
 
