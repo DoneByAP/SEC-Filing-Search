@@ -5,12 +5,6 @@ SEC RESEARCH API - FLEXIBLE FILING EXTRACTOR
 A comprehensive tool for downloading and extracting content from SEC filings
 with flexible date range and filing type selection.
 
-Author: [Your Name/Handle] - Original Creator
-License: MIT License (Open Source)
-Repository: https://github.com/[your-username]/sec-research-api
-Version: 1.0.0
-Last Updated: 2025
-
 FEATURES:
 ---------
 • Flexible date range filtering (presets or custom dates)
