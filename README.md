@@ -15,15 +15,19 @@ Powerful SEC filing extractor for Python. Download & parse SEC EDGAR filings (10
 
 ## Installation
 
-
-# Required packages
-pip install tiktoken requests
-
-# Clone and run
 git clone https://github.com/DoneByAP/SEC-Filing-Search.git
 cd SEC-Filing-Search
-python sec_get.py
 
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate        # Linux/Mac
+# venv\Scripts\activate         # Windows
+
+# Install required packages
+pip install requests tiktoken
+
+# Run
+python sec_get.py
 
 ## Usage
 
