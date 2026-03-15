@@ -20,8 +20,12 @@ cd SEC-Filing-Search
 
 # Create and activate virtual environment
 python3 -m venv venv
-source venv/bin/activate        # Linux/Mac
-# venv\Scripts\activate         # Windows
+
+# Linux/Mac
+source venv/bin/activate   
+
+# Windows
+venv\Scripts\activate        
 
 # Install required packages
 pip install requests tiktoken
